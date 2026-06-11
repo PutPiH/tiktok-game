@@ -4,6 +4,9 @@
   var STORAGE_KEY = "garden_2048_save_v1";
   var BEST_KEY = "garden_2048_best_v1";
   var MOVE_THRESHOLD = 24;
+  var MAX_PIXEL_RATIO = 2;
+  var TOAST_TTL = 1400;
+  var TOAST_FADE_DELAY = 1000;
 
   var platform = createPlatform();
   var canvas = platform.createCanvas();
@@ -18,6 +21,8 @@
   var dragState = null;
   var animationState = null;
   var toast = null;
+  var framePending = false;
+  var delayedRenderTimer = null;
 
   var tileThemes = {
     0: { bg: "#d8e2df", fg: "#65756f", label: "" },
@@ -131,7 +136,7 @@
           tt.onWindowResize(handler);
           return;
         }
-        if (typeof window !== "undefined") {
+        if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
           window.addEventListener("resize", handler);
         }
       },
@@ -191,7 +196,7 @@
       dragState.currentX = point.x;
       dragState.currentY = point.y;
       updateDragState();
-      render();
+      requestRender();
     }
 
     function onEnd(event) {
@@ -245,7 +250,7 @@
   }
 
   function bindKeyboard() {
-    if (typeof window === "undefined") {
+    if (typeof window === "undefined" || typeof window.addEventListener !== "function") {
       return;
     }
 
@@ -327,14 +332,18 @@
       return;
     }
 
-    var before = makeSnapshot();
     var plan = dragState.plan || calculateMove(state.board, dragState.direction);
-    var shouldCommit = plan.moved && dragState.distance >= commitDistance();
 
-    if (!plan.moved && dragState.distance >= commitDistance()) {
-      showToast("这个方向不能动");
+    if (!plan.moved) {
+      if (dragState.distance >= commitDistance()) {
+        showToast("这个方向不能动");
+      }
+      render();
+      return;
     }
 
+    var shouldCommit = dragState.distance >= commitDistance();
+    var before = shouldCommit ? makeSnapshot() : null;
     startSlideAnimation(dragState.direction, plan, before, dragState.distance, shouldCommit);
   }
 
@@ -370,14 +379,14 @@
       startedAt: Date.now(),
       duration: shouldCommit ? 130 : 105
     };
-    platform.requestFrame(render);
+    requestRender();
   }
 
   function resize() {
     var systemInfo = platform.getSystemInfo();
     logicalWidth = systemInfo.windowWidth || 375;
     logicalHeight = systemInfo.windowHeight || 667;
-    pixelRatio = systemInfo.pixelRatio || 1;
+    pixelRatio = Math.min(systemInfo.pixelRatio || 1, MAX_PIXEL_RATIO);
 
     canvas.width = Math.floor(logicalWidth * pixelRatio);
     canvas.height = Math.floor(logicalHeight * pixelRatio);
@@ -533,7 +542,7 @@
     addRandomTile(Math.random() < 0.92 ? 2 : 4);
   }
 
-  function addRandomTile(value) {
+  function addRandomTile(value, preferredDirection) {
     var emptyCells = [];
     for (var row = 0; row < SIZE; row += 1) {
       for (var col = 0; col < SIZE; col += 1) {
@@ -547,9 +556,45 @@
       return false;
     }
 
-    var picked = emptyCells[Math.floor(Math.random() * emptyCells.length)];
+    var preferredCells = getPreferredSpawnCells(emptyCells, preferredDirection);
+    var spawnPool = preferredCells.length ? preferredCells : emptyCells;
+    var picked = spawnPool[Math.floor(Math.random() * spawnPool.length)];
     state.board[picked.row][picked.col] = value;
     return true;
+  }
+
+  function getPreferredSpawnCells(emptyCells, direction) {
+    if (direction === "left") {
+      return filterCells(emptyCells, function (cell) {
+        return cell.col === SIZE - 1;
+      });
+    }
+    if (direction === "right") {
+      return filterCells(emptyCells, function (cell) {
+        return cell.col === 0;
+      });
+    }
+    if (direction === "up") {
+      return filterCells(emptyCells, function (cell) {
+        return cell.row === SIZE - 1;
+      });
+    }
+    if (direction === "down") {
+      return filterCells(emptyCells, function (cell) {
+        return cell.row === 0;
+      });
+    }
+    return [];
+  }
+
+  function filterCells(cells, predicate) {
+    var filtered = [];
+    for (var index = 0; index < cells.length; index += 1) {
+      if (predicate(cells[index])) {
+        filtered.push(cells[index]);
+      }
+    }
+    return filtered;
   }
 
   function generateNextTileValue(board) {
@@ -640,11 +685,11 @@
       return;
     }
 
-    applyMoveResult(result, before);
+    applyMoveResult(result, before, direction);
     render();
   }
 
-  function applyMoveResult(result, before) {
+  function applyMoveResult(result, before, direction) {
     state.history.push(before);
     if (state.history.length > 20) {
       state.history.shift();
@@ -656,7 +701,7 @@
       state.best = state.score;
     }
 
-    addRandomTile(state.nextTileValue);
+    addRandomTile(state.nextTileValue, direction);
     state.nextTileValue = generateNextTileValue(state.board);
     if (!state.hasWon && containsTile(TARGET_TILE)) {
       state.hasWon = true;
@@ -770,6 +815,13 @@
     animationState = null;
   }
 
+  function clearToastFadeTimer() {
+    if (delayedRenderTimer) {
+      clearTimeout(delayedRenderTimer);
+      delayedRenderTimer = null;
+    }
+  }
+
   function boardsEqual(a, b) {
     for (var row = 0; row < SIZE; row += 1) {
       for (var col = 0; col < SIZE; col += 1) {
@@ -825,8 +877,24 @@
     toast = {
       message: message,
       createdAt: Date.now(),
-      ttl: 1400
+      ttl: TOAST_TTL
     };
+    clearToastFadeTimer();
+    delayedRenderTimer = setTimeout(function () {
+      delayedRenderTimer = null;
+      requestRender();
+    }, TOAST_FADE_DELAY);
+  }
+
+  function requestRender() {
+    if (framePending) {
+      return;
+    }
+    framePending = true;
+    platform.requestFrame(function () {
+      framePending = false;
+      render();
+    });
   }
 
   function render() {
@@ -840,9 +908,17 @@
     drawFooter();
     drawToast();
 
-    if ((toast && Date.now() - toast.createdAt < toast.ttl) || animationState) {
-      platform.requestFrame(render);
+    if (animationState || isToastFading()) {
+      requestRender();
     }
+  }
+
+  function isToastFading() {
+    if (!toast) {
+      return false;
+    }
+    var elapsed = Date.now() - toast.createdAt;
+    return elapsed >= TOAST_FADE_DELAY && elapsed < toast.ttl;
   }
 
   function getActiveMotion() {
@@ -852,7 +928,7 @@
         var finishedAnimation = animationState;
         animationState = null;
         if (finishedAnimation.shouldCommit) {
-          applyMoveResult(finishedAnimation.plan, finishedAnimation.before);
+          applyMoveResult(finishedAnimation.plan, finishedAnimation.before, finishedAnimation.direction);
         }
         return null;
       }
@@ -1094,7 +1170,7 @@
       return;
     }
 
-    var alpha = elapsed < 1000 ? 1 : 1 - (elapsed - 1000) / 400;
+    var alpha = elapsed < TOAST_FADE_DELAY ? 1 : 1 - (elapsed - TOAST_FADE_DELAY) / (toast.ttl - TOAST_FADE_DELAY);
     ctx.save();
     ctx.globalAlpha = Math.max(0, alpha);
     var w = Math.min(logicalWidth - 48, 220);
